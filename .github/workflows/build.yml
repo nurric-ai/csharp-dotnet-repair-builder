@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       nshards:
-        description: "parallel shards to actually run (1-20)"
+        description: "total shard count (shared with Kaggle notebooks); Actions covers shards 0-19"
         required: false
-        default: "20"
+        default: "64"
       budget_minutes:
         description: "time budget per shard (minutes)"
         required: false
