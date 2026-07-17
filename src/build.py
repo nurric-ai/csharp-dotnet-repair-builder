@@ -90,6 +90,21 @@ def repo_has_tests(root):
     return False
 
 
+def find_test_projects(root):
+    """Return test .csproj paths. Building/testing THESE (not the .sln) avoids
+    building old .NET Framework TFMs that fail on Linux, and the library is built
+    in the (modern) TFM the test project consumes."""
+    out = []
+    for cs in find_csprojs(root):
+        try:
+            t = open(cs, encoding="utf-8", errors="ignore").read().lower()
+        except OSError:
+            continue
+        if any(k in t for k in TEST_PROJ_MARKERS):
+            out.append(cs)
+    return out
+
+
 def target_framework(root):
     for cs in find_csprojs(root):
         try:
@@ -204,12 +219,33 @@ def restore(target, root):
 
 def build(target, root):
     return run([DOTNET, "build", target, "-c", "Release", "--no-restore",
-                "-clp:ErrorsOnly", "-v", "m"], cwd=root, timeout=C.BUILD_TIMEOUT)
+                "-p:TreatWarningsAsErrors=false", "-clp:ErrorsOnly", "-v", "m"],
+               cwd=root, timeout=C.BUILD_TIMEOUT)
 
 
 def test(target, root):
     return run([DOTNET, "test", target, "-c", "Release", "--no-restore", "--no-build",
-                "--nologo"], cwd=root, timeout=C.TEST_TIMEOUT)
+                "-p:TreatWarningsAsErrors=false", "--nologo"], cwd=root, timeout=C.TEST_TIMEOUT)
+
+
+def build_targets(targets, root):
+    out = ""
+    for t in targets:
+        r, o = build(t, root)
+        out += o
+        if r != 0:
+            return r, out
+    return 0, out
+
+
+def test_targets(targets, root):
+    out = ""
+    for t in targets:
+        r, o = test(t, root)
+        out += o
+        if r != 0:
+            return r, out
+    return 0, out
 
 
 def _kill_compilers():
@@ -249,20 +285,25 @@ def baseline(root):
     rc, out = restore(sln, root)
     if rc != 0:
         return {"ok": False, "reason": "restore_failed", "output": out[-3000:]}
-    rc, bout = build(sln, root)
+    # Build/test the TEST projects specifically (not the .sln) so multi-targeted
+    # libraries are built only in the modern TFM the tests consume -> no .NET
+    # Framework TFM failures on Linux.
+    test_projs = find_test_projects(root)
+    targets = test_projs if test_projs else [sln]
+    has_t = bool(test_projs)
+    rc, bout = build_targets(targets, root)
     if rc != 0:
         return {"ok": False, "reason": "baseline_build_failed", "output": bout[-3000:]}
-    has_t = repo_has_tests(root)
-    info = {"ok": True, "sln": sln, "has_tests": has_t, "test_out": "",
-            "tests_before": ""}
+    info = {"ok": True, "sln": sln, "targets": targets, "has_tests": has_t,
+            "test_out": "", "tests_before": ""}
     if not has_t:
         return info
-    rc, tout = test(sln, root)
+    rc, tout = test_targets(targets, root)
     if rc != 0:
         return {"ok": False, "reason": "baseline_tests_fail", "output": tout[-3000:]}
     if not is_hermetic(root):
         return {"ok": False, "reason": "non_hermetic_tests", "output": ""}
-    rc2, tout2 = test(sln, root)        # flakiness check
+    rc2, tout2 = test_targets(targets, root)        # flakiness check
     if rc2 != 0:
         return {"ok": False, "reason": "flaky_tests", "output": tout2[-2000:]}
     info["test_out"] = tout
@@ -314,7 +355,7 @@ def _norm(s):
     return (s or "").replace("\r\n", "\n").replace("\r", "\n")
 
 
-def verify_one(root, sln, file, family, index, has_tests, tests_before):
+def verify_one(root, targets, file, family, index, has_tests, tests_before):
     """Apply one mutation, verify broken-fails + gold-passes. Returns task dict or None."""
     try:
         orig = _norm(open(file, encoding="utf-8-sig", errors="replace").read())
@@ -351,7 +392,7 @@ def verify_one(root, sln, file, family, index, has_tests, tests_before):
         # --- broken state: write mutated file in place ---
         with open(file, "w", encoding="utf-8", newline="") as fh:
             fh.write(mutated)
-        b_rc, b_out = build(sln, root)
+        b_rc, b_out = build_targets(targets, root)
         compiler_output = ""
         test_output = ""
         broken_via = None
@@ -360,7 +401,7 @@ def verify_one(root, sln, file, family, index, has_tests, tests_before):
             broken_via = "build"
             compiler_output = _truncate(b_out, 4000, "head")
         elif has_tests:
-            t_rc, t_out = test(sln, root)
+            t_rc, t_out = test_targets(targets, root)
             if t_rc != 0:
                 broken_via = "test"
                 test_output = _truncate(t_out, 8000, "tail")
@@ -368,19 +409,20 @@ def verify_one(root, sln, file, family, index, has_tests, tests_before):
         if broken_via is None:
             return None  # mutation had no observable effect -> not a valid task
         # determinism re-run
-        r_rc, _ = (build(sln, root) if broken_via == "build" else test(sln, root))
+        r_rc, _ = (build_targets(targets, root) if broken_via == "build"
+                   else test_targets(targets, root))
         if r_rc == 0:
             return None  # flaky / not deterministic
         # --- gold: restore original ---
         with open(file, "w", encoding="utf-8", newline="") as fh:
             fh.write(orig)
-        g_rc, g_out = build(sln, root)
+        g_rc, g_out = build_targets(targets, root)
         if g_rc != 0:
             return None  # gold doesn't compile -> reject (shouldn't happen vs baseline)
         tests_after = ""
         verify_after = 0
         if has_tests:
-            gt_rc, gt_out = test(sln, root)
+            gt_rc, gt_out = test_targets(targets, root)
             if gt_rc != 0:
                 return None  # gold fails tests -> reject
             tests_after = _test_summary(gt_out)
@@ -393,9 +435,9 @@ def verify_one(root, sln, file, family, index, has_tests, tests_before):
         fast_response = f"<patch>\n{gold_patch}</patch>"
         prompt = S.make_prompt(None, S._cat(family), mutated, compiler_output,
                                test_output, [rel], rel)
-        vcmd = (f"dotnet build {os.path.relpath(sln, root)} -c Release --no-restore"
+        vcmd = (f"dotnet build {os.path.relpath(targets[0], root)} -c Release --no-restore"
                 if broken_via == "build"
-                else f"dotnet test {os.path.relpath(sln, root)} -c Release --no-restore")
+                else f"dotnet test {os.path.relpath(targets[0], root)} -c Release --no-restore")
         task = {
             "task_id": "",        # filled by caller
             "repo_id": "", "repo_url": "", "commit_sha": "", "license": "",
@@ -533,7 +575,7 @@ def process_repo(repo_id, repo_url, license_name, log=print, max_tasks=None):
                     if (max_tasks and len(tasks) >= max_tasks) or time.time() - t_repo > C.PER_REPO_BUDGET_S:
                         break
                     attempted += 1
-                    t = verify_one(dst, sln, f, fam, idx, has_tests, tests_before)
+                    t = verify_one(dst, base["targets"], f, fam, idx, has_tests, tests_before)
                     if t is not None:
                         t["task_id"] = f"{repo_id}::{fam}::{t['source_hash'][:10]}"
                         t["repo_id"] = repo_id
