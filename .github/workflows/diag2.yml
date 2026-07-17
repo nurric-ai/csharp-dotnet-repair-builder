@@ -1,0 +1,42 @@
+name: diag2
+on: workflow_dispatch
+jobs:
+  diag2:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "10.0.x" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - run: dotnet publish mutator/mutator.csproj -c Release -o mutator_pub
+      - env: { HF_TOKEN: "${{ secrets.HF_TOKEN }}" }
+        run: |
+          export CPT_MUTATOR_DLL="$PWD/mutator_pub/mutator.dll"
+          export CPT_MUTATOR_DIR="$PWD/mutator_pub"
+          export CPT_REPAIR_ROOT="$RUNNER_TEMP/repair"
+          export NUGET_PACKAGES="$RUNNER_TEMP/nuget"
+          export DOTNET_ROLL_FORWARD=Major
+          python - <<'PY'
+          import os, sys, json
+          sys.path.insert(0, "src")
+          import build as B
+          from huggingface_hub import HfApi, hf_hub_download
+          tok = os.environ["HF_TOKEN"]; ds = "Nottybro/csharp-dotnet-repair-lora-v1"
+          fs = HfApi(token=tok).list_repo_files(ds, repo_type="dataset", token=tok)
+          mans = [f for f in fs if f.startswith("manifest_s") and f.endswith(".json")]
+          failed = []
+          for m in mans:
+              d = json.load(open(hf_hub_download(ds, m, repo_type="dataset", token=tok)))
+              for r, reason in d.get("processed", {}).items():
+                  if reason == "baseline_build_failed":
+                      failed.append(r)
+          print("baseline_build_failed count:", len(failed), flush=True)
+          for repo_id in failed[:6]:
+              url = "https://github.com/" + repo_id
+              tasks, stat = B.process_repo(repo_id, url, "mit", max_tasks=1)
+              print("\n===== %s :: %s =====" % (repo_id, stat.get("reason")), flush=True)
+              print("TFMs:", stat.get("tfms"), flush=True)
+              print((stat.get("output") or "")[:2200], flush=True)
+          PY
