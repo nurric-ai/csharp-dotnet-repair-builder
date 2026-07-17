@@ -1,10 +1,10 @@
-"""GitHub Actions batch runner: time-bounded + resumable.
+"""GitHub Actions batch runner: sharded + time-bounded + resumable.
 
-Each workflow run reads manifest.json (next_idx) from the HF dataset repo,
-processes a bounded window of candidates (until TIME_BUDGET_S or BATCH_REPOS),
-flushes raw/shard-*.parquet + updated manifest back, then exits. Repeated
-scheduled/dispatched runs walk the whole candidate list. All cloning/building/
-testing runs on an isolated GitHub runner -- never on a user's machine.
+NSHARDS jobs run in parallel (workflow matrix), each owning the candidates whose
+global index % NSHARDS == SHARD -- disjoint slices, so no two jobs touch the same
+repo and there is NO shared manifest to race on. Each shard writes its own
+manifest_s<SHARD>.json and raw/s<SHARD>-*.parquet. finalize.py aggregates all of
+them. All cloning/building/testing runs on the isolated GitHub runner.
 """
 import os, sys, json, time, shutil
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -17,8 +17,12 @@ from huggingface_hub import HfApi, CommitOperationAdd, hf_hub_download
 
 api = HfApi(token=C.TOKEN)
 SCHEMA = S.PARQUET_SCHEMA
-TIME_BUDGET = float(os.environ.get("TIME_BUDGET_S", "3000"))
-BATCH_REPOS = int(os.environ.get("BATCH_REPOS", "400"))
+SHARD = int(os.environ.get("SHARD", "0"))
+NSHARDS = int(os.environ.get("NSHARDS", "1"))
+TIME_BUDGET = float(os.environ.get("TIME_BUDGET_S", "2700"))
+BATCH_REPOS = int(os.environ.get("BATCH_REPOS", "9999"))
+SHARDED = NSHARDS > 1
+MAN_NAME = (f"manifest_s{SHARD}.json" if SHARDED else "manifest.json")
 
 
 def log(*a):
@@ -38,13 +42,16 @@ def load_candidates():
     return out
 
 
+def my_slice(cands):
+    return [(i, c) for i, c in enumerate(cands) if i % NSHARDS == SHARD]
+
+
 def load_manifest():
     try:
-        p = hf_hub_download(C.HF_REPO, "manifest.json", repo_type="dataset", token=C.TOKEN)
+        p = hf_hub_download(C.HF_REPO, MAN_NAME, repo_type="dataset", token=C.TOKEN)
         return json.load(open(p, encoding="utf-8"))
-    except Exception as e:
-        log("no manifest, fresh start:", repr(e)[:120])
-        return {"next_idx": 0, "processed": {}, "shards": [],
+    except Exception:
+        return {"processed": {}, "shards": [],
                 "counts": {"tasks": 0, "repos_built": 0, "repos_processed": 0}}
 
 
@@ -64,13 +71,13 @@ def commit(ops, msg):
 
 def save_manifest(man, extra_ops=None):
     os.makedirs(C.SCRATCH, exist_ok=True)
-    tmp = os.path.join(C.SCRATCH, "manifest.json")
+    tmp = os.path.join(C.SCRATCH, MAN_NAME)
     json.dump(man, open(tmp, "w"), indent=2)
-    ops = [CommitOperationAdd(path_in_repo="manifest.json", path_or_fileobj=tmp)] + list(extra_ops or [])
-    return commit(ops, "checkpoint: manifest" + (" + shard" if extra_ops else ""))
+    ops = [CommitOperationAdd(path_in_repo=MAN_NAME, path_or_fileobj=tmp)] + list(extra_ops or [])
+    return commit(ops, f"[shard {SHARD}] checkpoint" + (" + shard" if extra_ops else ""))
 
 
-def flush_shard(buf, man, shard_idx):
+def flush_shard(buf, man, sidx):
     rows = []
     for t in buf:
         t = dict(t)
@@ -80,11 +87,11 @@ def flush_shard(buf, man, shard_idx):
             t[k] = int(t.get(k) or 0)
         rows.append(t)
     tbl = pa.Table.from_pylist(rows, schema=SCHEMA)
-    path = os.path.join(C.SCRATCH, f"raw_{shard_idx:05d}.parquet")
+    path = os.path.join(C.SCRATCH, f"raw_{SHARD}_{sidx:05d}.parquet")
     pq.write_table(tbl, path, compression="ZSTD", compression_level=9)
-    repo_path = f"raw/shard-{shard_idx:05d}.parquet"
-    op = CommitOperationAdd(path_in_repo=repo_path, path_or_fileobj=path)
-    man["shards"].append({"file": repo_path, "rows": len(rows)})
+    rp = (f"raw/s{SHARD:02d}-{sidx:05d}.parquet" if SHARDED else f"raw/shard-{sidx:05d}.parquet")
+    op = CommitOperationAdd(path_in_repo=rp, path_or_fileobj=path)
+    man["shards"].append({"file": rp, "rows": len(rows)})
     man["counts"]["tasks"] = man["counts"].get("tasks", 0) + len(rows)
     ok = save_manifest(man, extra_ops=[op])
     if ok:
@@ -92,35 +99,33 @@ def flush_shard(buf, man, shard_idx):
             os.remove(path)
         except OSError:
             pass
-        log(f"  >> flushed {repo_path} ({len(rows)} rows) | total tasks={man['counts']['tasks']}")
+        log(f"  >> flushed {rp} ({len(rows)} rows) | shard tasks={man['counts']['tasks']}")
     return ok
 
 
 def main():
     cands = load_candidates()
+    sl = my_slice(cands)
     man = load_manifest()
     processed = set(man.get("processed", {}).keys())
     buf = []
-    shard_idx = len(man.get("shards", []))
-    idx = man.get("next_idx", 0)
-    while idx < len(cands) and cands[idx][0] in processed:
-        idx += 1
+    sidx = len(man.get("shards", []))
     t0 = time.time()
     repos_done = 0
-    log(f"=== gh_runner start | {len(cands)} cands | idx={idx} | "
-        f"budget={TIME_BUDGET:.0f}s | cap={BATCH_REPOS} | disk={B.free_gb():.1f}G ===")
-
-    while idx < len(cands):
+    log(f"=== shard {SHARD}/{NSHARDS} | slice={len(sl)} | budget={TIME_BUDGET:.0f}s "
+        f"| cap={BATCH_REPOS} | disk={B.free_gb():.1f}G ===")
+    for gidx, (repo, lic) in sl:
+        if repo in processed:
+            continue
         if time.time() - t0 > TIME_BUDGET:
-            log("time budget reached -> stopping run"); break
+            log("time budget reached"); break
         if repos_done >= BATCH_REPOS:
-            log("batch repo cap reached"); break
+            log("batch cap reached"); break
         if B.free_gb() < C.MIN_FREE_DISK_GB:
             shutil.rmtree(C.NUGET, ignore_errors=True)
             os.makedirs(C.NUGET, exist_ok=True)
             if B.free_gb() < C.MIN_FREE_DISK_GB:
-                log("low disk -> stopping run"); break
-        repo, lic = cands[idx]
+                log("low disk -> stop"); break
         url = "https://github.com/" + repo
         try:
             tasks, stat = B.process_repo(repo, url, lic, max_tasks=C.MAX_MUTATIONS_PER_REPO)
@@ -134,22 +139,20 @@ def main():
             man["counts"]["repos_built"] = man["counts"].get("repos_built", 0) + 1
         buf += tasks
         repos_done += 1
-        idx += 1
-        man["next_idx"] = idx
-        log(f"[{idx:5d}/{len(cands)}] {repo:42s} kept={stat.get('kept',0):3d} "
+        log(f"[s{SHARD} g{gidx}] {repo:42s} kept={stat.get('kept',0):3d} "
             f"reason={stat.get('reason')} buf={len(buf)} t={time.time()-t0:.0f}s")
-        if len(buf) >= C.SHARD_ROWS or repos_done % 20 == 0:
+        if len(buf) >= 1500 or repos_done % 15 == 0:
             if buf:
-                if flush_shard(buf, man, shard_idx):
+                if flush_shard(buf, man, sidx):
                     buf = []
-                    shard_idx += 1
+                    sidx += 1
             else:
                 save_manifest(man)
     if buf:
-        flush_shard(buf, man, shard_idx)
+        flush_shard(buf, man, sidx)
     save_manifest(man)
-    log(f"=== gh_runner run done | +{repos_done} repos | next_idx={man['next_idx']} | "
-        f"total tasks={man['counts'].get('tasks')} | built={man['counts'].get('repos_built')} ===")
+    log(f"=== shard {SHARD} done | +{repos_done} repos | tasks={man['counts'].get('tasks')} "
+        f"built={man['counts'].get('repos_built')} ===")
 
 
 if __name__ == "__main__":

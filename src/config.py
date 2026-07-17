@@ -61,7 +61,10 @@ BUILD_TIMEOUT       = 300      # dotnet build (s)
 TEST_TIMEOUT        = 600      # dotnet test (s)
 RESTORE_TIMEOUT     = 600      # dotnet restore (s)
 CLONE_TIMEOUT       = 180
-MAX_MUTATIONS_PER_REPO = 40
+MAX_MUTATIONS_PER_REPO = 25
+PER_REPO_BUDGET_S      = 180      # hard wall-clock cap per repo -> a pathological repo
+                                  # (huge/slow test suite) can never eat a whole run; tuned
+                                  # for throughput (favors moving on to faster repos)
 MAX_FILE_CHARS      = 120_000  # skip files larger than this for mutation
 MIN_FILE_CHARS      = 40
 

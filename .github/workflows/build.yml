@@ -1,22 +1,25 @@
 name: build-repair-tasks
 
-# Processes a bounded, resumable batch of C#/.NET repos each run: clone -> build/test
-# baseline -> inject one mutation -> verify broken-fails + gold-passes -> push raw
-# shards + manifest to the HF dataset repo. Repeated runs walk the whole candidate
-# list. All third-party build/test code executes ONLY on this isolated runner.
+# 20-way parallel matrix: each shard owns candidates whose global index % 20 ==
+# shard. Disjoint slices -> no manifest races. All third-party build/test code
+# runs ONLY on isolated GitHub runners. Resumable per-shard via manifest_s<i>.json.
 on:
   workflow_dispatch:
     inputs:
+      nshards:
+        description: "parallel shards to actually run (1-20)"
+        required: false
+        default: "20"
       budget_minutes:
-        description: "time budget for this run (minutes)"
+        description: "time budget per shard (minutes)"
         required: false
-        default: "50"
-      max_repos:
-        description: "max repos to process this run"
-        required: false
-        default: "400"
+        default: "45"
   schedule:
-    - cron: "23 */4 * * *"   # every 4 hours
+    - cron: "23 * * * *"
+
+concurrency:
+  group: build-repair-tasks
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -24,7 +27,12 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     steps:
       - uses: actions/checkout@v4
 
@@ -44,22 +52,24 @@ jobs:
       - name: Publish mutator
         run: dotnet publish mutator/mutator.csproj -c Release -o mutator_pub
 
-      - name: Run batch builder
+      - name: Run shard builder
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -e
-          BUDGET="${{ github.event.inputs.budget_minutes || '50' }}"
-          MAXR="${{ github.event.inputs.max_repos || '400' }}"
+          BUDGET="${{ github.event.inputs.budget_minutes || '45' }}"
+          NS="${{ github.event.inputs.nshards || '20' }}"
+          export SHARD="${{ matrix.shard }}"
+          if [ "$SHARD" -ge "$NS" ]; then echo "shard $SHARD >= nshards $NS -> skip"; exit 0; fi
+          export NSHARDS="$NS"
           export CPT_MUTATOR_DLL="$PWD/mutator_pub/mutator.dll"
           export CPT_MUTATOR_DIR="$PWD/mutator_pub"
           export CPT_CANDIDATES="$PWD/candidates.txt"
           export CPT_REPAIR_ROOT="$RUNNER_TEMP/repair"
           export NUGET_PACKAGES="$RUNNER_TEMP/nuget"
           export TIME_BUDGET_S=$(( BUDGET * 60 ))
-          export BATCH_REPOS="$MAXR"
           python src/gh_runner.py
 
-      - name: Summary
+      - name: Shard summary
         if: always()
-        run: echo "run complete; progress checkpointed in manifest.json on HF"
+        run: echo "shard ${{ matrix.shard }} done; progress in manifest_s${{ matrix.shard }}.json on HF"

@@ -503,8 +503,9 @@ def process_repo(repo_id, repo_url, license_name, log=print, max_tasks=None):
         random.shuffle(files)
         tasks = []
         attempted = 0
+        t_repo = time.time()
         for f in files:
-            if max_tasks and len(tasks) >= max_tasks:
+            if (max_tasks and len(tasks) >= max_tasks) or time.time() - t_repo > C.PER_REPO_BUDGET_S:
                 break
             rc, enum_out = run([DOTNET, MUTATOR_DLL, "enumerate", f], timeout=60)
             if rc != 0:
@@ -519,6 +520,8 @@ def process_repo(repo_id, repo_url, license_name, log=print, max_tasks=None):
             for p in pts:
                 by_fam.setdefault(p["family"], []).append(p)
             for fam, lst in by_fam.items():
+                if (max_tasks and len(tasks) >= max_tasks) or time.time() - t_repo > C.PER_REPO_BUDGET_S:
+                    break
                 if fam == "compile" and not has_tests:
                     pass  # compile tasks valid even w/o tests
                 # logic/async/linq/framework need tests to detect failures
@@ -527,7 +530,7 @@ def process_repo(repo_id, repo_url, license_name, log=print, max_tasks=None):
                 idxs = list(range(min(len(lst), 6)))  # up to 6 points/family/file
                 random.shuffle(idxs)
                 for idx in idxs[:3]:
-                    if max_tasks and len(tasks) >= max_tasks:
+                    if (max_tasks and len(tasks) >= max_tasks) or time.time() - t_repo > C.PER_REPO_BUDGET_S:
                         break
                     attempted += 1
                     t = verify_one(dst, sln, f, fam, idx, has_tests, tests_before)
