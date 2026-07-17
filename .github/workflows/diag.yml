@@ -1,0 +1,43 @@
+name: diag
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "owner/repo to diagnose"
+        required: false
+        default: "benaadams/Ben.Demystifier"
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "10.0.x" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements.txt
+      - run: dotnet publish mutator/mutator.csproj -c Release -o mutator_pub
+      - env: { REPO_IN: "${{ github.event.inputs.repo }}" }
+        run: |
+          set -e
+          export CPT_MUTATOR_DLL="$PWD/mutator_pub/mutator.dll"
+          export CPT_MUTATOR_DIR="$PWD/mutator_pub"
+          export CPT_CANDIDATES="$PWD/candidates.txt"
+          export CPT_REPAIR_ROOT="$RUNNER_TEMP/repair"
+          export NUGET_PACKAGES="$RUNNER_TEMP/nuget"
+          export DOTNET_ROLL_FORWARD=Major
+          export DOTNET_NOLOGO=true
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, "src")
+          import build as B
+          targets = [os.environ.get("REPO_IN","benaadams/Ben.Demystifier"), "sprache/Sprache"]
+          for repo in targets:
+              lic = "apache-2.0" if "Demystifier" in repo else "mit"
+              url = "https://github.com/" + repo
+              print("\n############## DIAG %s ##############" % repo, flush=True)
+              tasks, stat = B.process_repo(repo, url, lic, max_tasks=1)
+              print("REASON:", stat.get("reason"), "| kept:", len(tasks), flush=True)
+              print("OUTPUT:\n" + (stat.get("output") or "")[:3000], flush=True)
+              print("TFMs seen:", stat.get("tfms"), flush=True)
+          PY
