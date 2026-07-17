@@ -1,0 +1,65 @@
+name: build-repair-tasks
+
+# Processes a bounded, resumable batch of C#/.NET repos each run: clone -> build/test
+# baseline -> inject one mutation -> verify broken-fails + gold-passes -> push raw
+# shards + manifest to the HF dataset repo. Repeated runs walk the whole candidate
+# list. All third-party build/test code executes ONLY on this isolated runner.
+on:
+  workflow_dispatch:
+    inputs:
+      budget_minutes:
+        description: "time budget for this run (minutes)"
+        required: false
+        default: "50"
+      max_repos:
+        description: "max repos to process this run"
+        required: false
+        default: "400"
+  schedule:
+    - cron: "23 */4 * * *"   # every 4 hours
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Publish mutator
+        run: dotnet publish mutator/mutator.csproj -c Release -o mutator_pub
+
+      - name: Run batch builder
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -e
+          BUDGET="${{ github.event.inputs.budget_minutes || '50' }}"
+          MAXR="${{ github.event.inputs.max_repos || '400' }}"
+          export CPT_MUTATOR_DLL="$PWD/mutator_pub/mutator.dll"
+          export CPT_MUTATOR_DIR="$PWD/mutator_pub"
+          export CPT_CANDIDATES="$PWD/candidates.txt"
+          export CPT_REPAIR_ROOT="$RUNNER_TEMP/repair"
+          export NUGET_PACKAGES="$RUNNER_TEMP/nuget"
+          export TIME_BUDGET_S=$(( BUDGET * 60 ))
+          export BATCH_REPOS="$MAXR"
+          python src/gh_runner.py
+
+      - name: Summary
+        if: always()
+        run: echo "run complete; progress checkpointed in manifest.json on HF"

@@ -1,0 +1,39 @@
+# Curated seed repos: modern .NET, permissively licensed, with unit tests.
+# ORDERED: small/fast/tested first for quick validation, larger later.
+# The build harness GATES every one by real dotnet build/test, so a stale or
+# wrong-license pick is simply skipped -- never fabricated. Format: repo<TAB>license
+# Licenses are RE-VERIFIED from the cloned LICENSE file by detect_license().
+sprache/Sprache	mit
+sprache/Superpower	mit
+sqlite-net/sqlite-net	mit
+morelinq/MoreLINQ	mit
+benaadams/Ben.Demystifier	apache-2.0
+Tyrrrz/CliWrap	mit
+Cysharp/ZLogger	mit
+Cysharp/MessagePipe	mit
+commandlineparser/commandline	mit
+Humanizr/Humanizer	mit
+nodatime/nodatime	apache-2.0
+FluentValidation/FluentValidation	apache-2.0
+MediatR/MediatR	apache-2.0
+AutoMapper/AutoMapper	mit
+App-vNext/Polly	bsd-3-clause
+serilog/serilog	apache-2.0
+AngleSharp/AngleSharp	mit
+ClosedXML/ClosedXML	mit
+aaubry/YamlDotNet	mit
+JoshClose/CsvHelper	apache-2.0
+DapperLib/Dapper	apache-2.0
+protobuf-net/protobuf-net	apache-2.0
+jstedfast/MimeKit	mit
+microsoft/vs-threading	mit
+dotnet/command-line-api	mit
+nsubstitute/NSubstitute	bsd-3-clause
+moq/moq	bsd-3-clause
+nunit/nunit	mit
+fakeiteasy/FakeItEasy	mit
+Sergio0694/ComputeSharp	mit
+Cysharp/MemoryPack	mit
+Cysharp/R3	mit
+anjdreas/UnitsNet	mit
+neuecc/MessagePack-CSharp	mit
